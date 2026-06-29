@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+﻿import { useState, useCallback, useRef, useEffect } from 'react';
 import { Chess } from 'chess.js';
 import type { Move } from 'chess.js';
 import type * as cg from '@lichess-org/chessground/types';
@@ -7,11 +7,25 @@ import { EvalBar } from './components/EvalBar';
 import { MoveHistory } from './components/MoveHistory';
 import type { MoveRecord } from './components/MoveHistory';
 import { AnalysisPanel } from './components/AnalysisPanel';
+import { HomeScreen } from './components/HomeScreen';
+import { PositionEditor } from './components/PositionEditor';
+import { SettingsPage } from './components/SettingsPage';
 import { useStockfish } from './hooks/useStockfish';
 import type { CandidateMove, StockfishEval, LineStep } from './hooks/useStockfish';
+import { useLlmAnalysis } from './hooks/useLlmAnalysis';
+import { LlmAnalysisPanel } from './components/LlmAnalysisPanel';
+import { OpeningBrowser } from './components/OpeningBrowser';
+import { OpeningPractice } from './components/OpeningPractice';
+import { useOpeningTrainer } from './hooks/useOpeningTrainer';
+import type { TrainerOpening } from './hooks/useOpeningTrainer';
 import './App.css';
 
+type Page = 'home' | 'analysis' | 'setup' | 'settings' | 'opening_browser' | 'opening_practice';
+
 function App() {
+  const [currentPage, setCurrentPage] = useState<Page>('home');
+  const [initialFen, setInitialFen] = useState<string | null>(null);
+
   const chessRef = useRef(new Chess());
   const boardRef = useRef<ChessBoardHandle>(null);
   const [moveRecords, setMoveRecords] = useState<MoveRecord[]>([]);
@@ -21,6 +35,9 @@ function App() {
   const [, forceUpdate] = useState(0);
 
   const stockfish = useStockfish();
+  const llm = useLlmAnalysis();
+  const openingTrainer = useOpeningTrainer();
+  const [selectedOpening, setSelectedOpening] = useState<TrainerOpening | null>(null);
 
   const currentAnalysisRef = useRef<ReturnType<typeof useStockfish>['analysis']>(null);
   const pendingEvalBeforeRef = useRef<StockfishEval | null>(null);
@@ -73,10 +90,10 @@ function App() {
   }, [stockfish.analysis, stockfish.isEvaluating]);
 
   useEffect(() => {
-    if (stockfish.isReady && moveRecords.length === 0) {
+    if (stockfish.isReady && moveRecords.length === 0 && currentPage === 'analysis') {
       stockfish.analyze(chessRef.current.fen(), 18, 3);
     }
-  }, [stockfish.isReady]);
+  }, [stockfish.isReady, currentPage]);
 
   const uciToSan = useCallback((uci: string, fen: string): string => {
     try {
@@ -142,7 +159,11 @@ function App() {
   }, [stockfish]);
 
   const handleReset = useCallback(() => {
-    chessRef.current.reset();
+    if (initialFen) {
+      chessRef.current = new Chess(initialFen);
+    } else {
+      chessRef.current.reset();
+    }
     setMoveRecords([]);
     setSelectedMoveIndex(null);
     setLastMove([]);
@@ -150,7 +171,7 @@ function App() {
     pendingEvalBeforeRef.current = null;
     stockfish.analyze(chessRef.current.fen(), 18, 3);
     forceUpdate(n => n + 1);
-  }, [stockfish]);
+  }, [stockfish, initialFen]);
 
   const handleFlipBoard = useCallback(() => {
     setOrientation(prev => prev === 'white' ? 'black' : 'white');
@@ -263,9 +284,103 @@ function App() {
     input.click();
   }, [stockfish]);
 
+  // Navigate from position editor to analysis with custom FEN
+  const handleEditorComplete = useCallback((fen: string) => {
+    setInitialFen(fen);
+    chessRef.current = new Chess(fen);
+    setMoveRecords([]);
+    setSelectedMoveIndex(null);
+    setLastMove([]);
+    currentAnalysisRef.current = null;
+    pendingEvalBeforeRef.current = null;
+    forceUpdate(n => n + 1);
+    setCurrentPage('analysis');
+  }, []);
+
+  const handleNavigate = useCallback((page: 'analysis' | 'setup' | 'settings' | 'opening_browser') => {
+    if (page === 'analysis') {
+      // Reset to standard starting position
+      setInitialFen(null);
+      chessRef.current = new Chess();
+      setMoveRecords([]);
+      setSelectedMoveIndex(null);
+      setLastMove([]);
+      currentAnalysisRef.current = null;
+      pendingEvalBeforeRef.current = null;
+      forceUpdate(n => n + 1);
+    }
+    setCurrentPage(page);
+  }, []);
+
+  // Handler for "Ask AI" button
   const currentRecord = selectedMoveIndex !== null ? moveRecords[selectedMoveIndex] : null;
   const currentFen = chessRef.current.fen();
   const isLatestPosition = selectedMoveIndex === null || selectedMoveIndex === moveRecords.length - 1;
+
+
+  const handleAskLlm = useCallback(() => {
+    if (!stockfish.isReady) return;
+    if (moveRecords.length === 0) return;
+    if (!isLatestPosition) return;
+
+    const chess = chessRef.current;
+    const lastMoveSan = moveRecords.length > 0
+      ? moveRecords[moveRecords.length - 1].move.san
+      : null;
+
+    const latestAnalysis = currentAnalysisRef.current || stockfish.analysis;
+    const engineCandidates: { uci: string; san: string; cp: number | null; mate: number | null; depth: number }[] = [];
+
+    if (latestAnalysis) {
+      for (const c of latestAnalysis.candidates) {
+        const san = c.san || (c.uci ? uciToSan(c.uci, chess.fen()) : '');
+        engineCandidates.push({
+          uci: c.uci,
+          san,
+          cp: c.cp,
+          mate: c.mate,
+          depth: c.depth,
+        });
+      }
+    }
+
+    const evalData = latestAnalysis?.bestEval
+      ? latestAnalysis.bestEval
+      : (stockfish.liveEval ?? null);
+
+    llm.requestAnalysis(
+      chess.fen(),
+      chess.history({ verbose: true }),
+      evalData,
+      engineCandidates,
+      lastMoveSan,
+      chess.inCheck(),
+      chess.isCheckmate(),
+      chess.isDraw(),
+      chess.turn(),
+    );
+  }, [stockfish, moveRecords, isLatestPosition, chessRef, uciToSan, llm]);
+
+  const handleStartOpening = useCallback((opening: TrainerOpening) => {
+    setSelectedOpening(opening);
+    openingTrainer.startOpening(opening);
+    setCurrentPage('opening_practice');
+  }, [openingTrainer]);
+
+  const handleBackFromOpening = useCallback(() => {
+    setSelectedOpening(null);
+    openingTrainer.resetTraining();
+    setCurrentPage('home');
+  }, [openingTrainer]);
+
+  const handleOpenOpeningBrowser = useCallback(() => {
+    setCurrentPage('opening_browser');
+  }, []);
+
+  const handleBackToHome = useCallback(() => {
+    setCurrentPage('home');
+    stockfish.stop();
+  }, [stockfish]);
 
   const getGameStatus = (): string => {
     const chess = chessRef.current;
@@ -280,13 +395,45 @@ function App() {
 
   return (
     <div className="app">
-      <header className="app-header">
-        <h1>{'\u56FD\u9645\u8C61\u68CB\u5B66\u4E60\u52A9\u624B'}</h1>
-        <div className="engine-status">
-          <span className={`status-dot ${stockfish.isReady ? 'ready' : 'loading'}`} />
-          {stockfish.isReady ? 'Stockfish \u5F15\u64CE\u5C31\u7EEA' : '\u5F15\u64CE\u52A0\u8F7D\u4E2D...'}
-        </div>
-      </header>
+      {currentPage === 'home' && (
+        <HomeScreen onNavigate={handleNavigate} />
+      )}
+  
+      {currentPage === 'setup' && (
+        <PositionEditor onBack={handleBackToHome} onComplete={handleEditorComplete} />
+      )}
+  
+      {currentPage === 'settings' && (
+        <SettingsPage onBack={handleBackToHome} />
+      )}
+  
+
+      {currentPage === 'opening_browser' && (
+        <OpeningBrowser onSelect={handleStartOpening} onBack={handleBackFromOpening} />
+      )}
+
+      {currentPage === 'opening_practice' && selectedOpening && (
+        <OpeningPractice
+          opening={selectedOpening}
+          steps={openingTrainer.steps}
+          currentStepIndex={openingTrainer.currentStepIndex}
+          status={openingTrainer.status}
+          onPlayerMove={openingTrainer.handlePlayerMove}
+          onFinish={openingTrainer.finishTraining}
+          onBack={handleBackFromOpening}
+          engineCandidates={openingTrainer.engineCandidates}
+        />
+      )}
+      {currentPage === 'analysis' && (
+        <>
+          <header className="app-header">
+            <button className="back-btn" onClick={handleBackToHome}>&larr;</button>
+            <h1>{'国际象棋学习助手'}</h1>
+            <div className="engine-status">
+              <span className={`status-dot ${stockfish.isReady ? 'ready' : 'loading'}`} />
+              {stockfish.isReady ? 'Stockfish 引擎就绪' : '引擎加载中...'}
+            </div>
+          </header>
 
       <main className="app-main">
         <div className="board-section">
@@ -327,6 +474,15 @@ function App() {
             onStartLine={handleStartLine}
             onStopLine={handleStopLine}
           />
+          <LlmAnalysisPanel
+            advice={llm.advice}
+            isLoading={llm.isLoading}
+            error={llm.error}
+            onAskAi={handleAskLlm}
+            onClear={llm.clearAdvice}
+            isLatestPosition={isLatestPosition}
+            hasMoves={moveRecords.length > 0}
+          />
           <MoveHistory
             moves={moveRecords}
             selectedIndex={selectedMoveIndex}
@@ -334,8 +490,11 @@ function App() {
           />
         </div>
       </main>
+        </>
+      )}
     </div>
   );
 }
 
 export default App;
+
